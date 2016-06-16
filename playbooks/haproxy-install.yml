@@ -1,0 +1,117 @@
+---
+# Copyright 2014, Rackspace US, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+- name: haproxy container config
+  hosts: haproxy_all
+  gather_facts: "{{ gather_facts | default(True) }}"
+  max_fail_percentage: 0
+  user: root
+  tasks:
+    - name: Use the lxc-openstack aa profile
+      lxc_container:
+        name: "{{ container_name }}"
+        container_config:
+          - "lxc.aa_profile=lxc-openstack"
+      delegate_to: "{{ physical_host }}"
+      when: not is_metal | bool
+      register: container_config
+      tags:
+        - lxc-aa-profile
+    - name: Wait for container ssh
+      wait_for:
+        port: "22"
+        delay: "{{ ssh_delay }}"
+        search_regex: "OpenSSH"
+        host: "{{ ansible_ssh_host }}"
+      delegate_to: "{{ physical_host }}"
+      when:
+        - container_config is defined
+        - container_config | changed
+      register: ssh_wait_check
+      until: ssh_wait_check | success
+      retries: 3
+      tags:
+        - ssh-wait
+  vars:
+    is_metal: "{{ properties.is_metal|default(false) }}"
+  tags:
+    - haproxy-lxc-container-setup
+
+- hosts: haproxy
+  gather_facts: "{{ gather_facts | default(True) }}"
+  user: root
+  vars_files:
+    - "{{ haproxy_keepalived_vars_file | default('vars/configs/keepalived_haproxy.yml')}}"
+  roles:
+    - role: "keepalived"
+      when: haproxy_use_keepalived | bool
+
+- name: Install haproxy
+  hosts: haproxy
+  gather_facts: "{{ gather_facts | default(True) }}"
+  max_fail_percentage: 20
+  user: root
+  pre_tasks:
+    - name: Remove legacy haproxy configuration files
+      file:
+        dest: "/etc/haproxy/conf.d/{{ item }}"
+        state: "absent"
+      with_items:
+        - "keystone_internal"
+      when: internal_lb_vip_address == external_lb_vip_address
+      tags:
+        - haproxy-service-config
+    - name: Create log dir
+      file:
+        path: "{{ item.path }}"
+        state: directory
+      with_items:
+        - { path: "/openstack/log/{{ inventory_hostname }}-haproxy" }
+      when: is_metal | bool
+      tags:
+        - haproxy-logs
+    - name: Create log aggregation links
+      file:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        state: "{{ item.state }}"
+        force: "yes"
+      with_items:
+        - { src: "/openstack/log/{{ inventory_hostname }}-haproxy", dest: "/var/log/haproxy", state: "link" }
+      when: is_metal | bool
+      tags:
+        - haproxy-logs
+    - name: Remove legacy haproxy logging file
+      file:
+        dest: "/etc/rsyslog.d/haproxy.conf"
+        state: "absent"
+      tags:
+        - haproxy-service-config
+  roles:
+    - role: "haproxy_server"
+      tags:
+        - "haproxy-server"
+    - role: "rsyslog_client"
+      rsyslog_client_log_rotate_file: haproxy_log_rotate
+      rsyslog_client_log_dir: "/var/log/haproxy"
+      rsyslog_client_config_name: "99-haproxy-rsyslog-client.conf"
+      tags:
+        - "haproxy-rsyslog-client"
+        - "rsyslog-client"
+  vars_files:
+    - vars/configs/haproxy_config.yml
+  vars:
+    is_metal: "{{ properties.is_metal|default(false) }}"
+
